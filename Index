@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FQC 外箱 SN 比對防呆系統</title>
+  <!-- 引入 SheetJS 用於解析與匯出 Excel -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: #f4f6f9; margin: 0; padding: 20px; color: #333; }
+    .container { max-width: 800px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+    h2 { text-align: center; color: #1a365d; margin-top: 0; }
+    .form-group { margin-bottom: 15px; }
+    label { display: block; font-weight: bold; margin-bottom: 5px; color: #4a5568; }
+    input[type="text"], input[type="date"], input[type="file"] { width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 16px; }
+    button { width: 100%; padding: 12px; background-color: #3182ce; color: white; border: none; border-radius: 6px; font-size: 18px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+    button:hover { background-color: #2b6cb0; }
+    
+    /* 彈出視窗 Modal */
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); justify-content: center; align-items: center; z-index: 1000; }
+    .modal-content { background: white; padding: 30px; border-radius: 12px; width: 90%; max-width: 550px; text-align: center; position: relative; }
+    
+    .status-msg { font-size: 20px; font-weight: bold; padding: 12px; border-radius: 6px; margin: 15px 0; min-height: 50px; display: flex; align-items: center; justify-content: center; }
+    .status-init { background: #e2e8f0; color: #4a5568; }
+    .status-pass { background: #c6f6d5; color: #22543d; border: 2px solid #38a169; }
+    .status-fail { background: #fed7d7; color: #742a2a; border: 2px solid #e53e3e; }
+    .status-finish { background: #ebf8ff; color: #2b6cb0; border: 2px solid #3182ce; }
+
+    .progress { font-size: 18px; font-weight: bold; margin-bottom: 15px; color: #2d3748; }
+    .scan-input { width: 100%; padding: 15px; font-size: 20px; text-align: center; border: 2px solid #3182ce; border-radius: 6px; outline: none; }
+    .btn-finish { background-color: #38a169; margin-top: 15px; display: none; }
+    .btn-finish:hover { background-color: #2f855a; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h2>📋 FQC 外箱 SN 比對驗證</h2>
+  
+  <div class="form-group">
+    <label>1. 檢驗人員姓名：</label>
+    <input type="text" id="inspectorName" placeholder="請輸入姓名">
+  </div>
+
+  <div class="form-group">
+    <label>2. 檢驗日期：</label>
+    <input type="date" id="inspectDate">
+  </div>
+
+  <div class="form-group">
+    <label>3. 匯入外箱 Excel 檔案：</label>
+    <input type="file" id="excelFile" accept=".xlsx, .xls, .csv">
+  </div>
+
+  <button onclick="startInspection()">開始比對驗證</button>
+</div>
+
+<!-- 刷條碼作業視窗 -->
+<div class="modal" id="scanModal">
+  <div class="modal-content">
+    <h3>📦 FQC 條碼刷驗中</h3>
+    <div class="progress" id="progressText">進度：0 / 0</div>
+    
+    <div id="statusBox" class="status-msg status-init">請開始刷入第 1 個成品 SN...</div>
+    
+    <input type="text" id="snScanner" class="scan-input" placeholder="請用條碼槍刷入 SN..." autofocus onkeypress="handleScan(event)">
+    
+    <button id="finishBtn" class="btn-finish" onclick="exportResult()">完成檢驗並匯出 Excel 結果</button>
+  </div>
+</div>
+
+<script>
+  // 自動預設今天日期
+  document.getElementById('inspectDate').valueAsDate = new Date();
+
+  let excelData = [];
+  let targetSNs = new Set();
+  let scannedSNs = new Set();
+  let totalCount = 0;
+  let scanLogs = []; // 紀錄比對結果歷史
+
+  function startInspection() {
+    const name = document.getElementById('inspectorName').value.trim();
+    const date = document.getElementById('inspectDate').value;
+    const fileInput = document.getElementById('excelFile');
+
+    if (!name) return alert('請輸入檢驗人員姓名！');
+    if (!date) return alert('請選擇檢驗日期！');
+    if (!fileInput.files.length) return alert('請選擇要匯入的 Excel 檔案！');
+
+    const file = fileInput.files[0];
+    const reader = new FileReader();
+
+    reader.onload = function(e) {
+      const data = new Uint8Array(e.target.result);
+      const workbook = XLSX.read(data, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      excelData = XLSX.utils.sheet_to_json(firstSheet);
+
+      if (excelData.length === 0) return alert('Excel 內沒有資料！');
+
+      // 尋找「產品序號_SN」欄位（不管排在第幾行）
+      targetSNs.clear();
+      scannedSNs.clear();
+      scanLogs = [];
+
+      let snKey = Object.keys(excelData[0]).find(k => k.trim() === '產品序號_SN');
+
+      if (!snKey) {
+        return alert('找不到「產品序號_SN」欄位，請檢查 Excel 表頭名稱是否正確！');
+      }
+
+      excelData.forEach(row => {
+        if (row[snKey]) {
+          targetSNs.add(String(row[snKey]).trim());
+        }
+      });
+
+      totalCount = targetSNs.size;
+      updateProgress();
+
+      // 開啟刷碼視窗
+      document.getElementById('scanModal').style.display = 'flex';
+      focusScanner();
+    };
+
+    reader.readAsArrayBuffer(file);
+  }
+
+  function handleScan(event) {
+    if (event.key === 'Enter') {
+      const inputEl = document.getElementById('snScanner');
+      const inputSN = inputEl.value.trim();
+      inputEl.value = ''; // 清空輸入框
+
+      if (!inputSN) return;
+
+      const statusBox = document.getElementById('statusBox');
+
+      // 1. 檢查是否重複刷入
+      if (scannedSNs.has(inputSN)) {
+        setStatus(`FAIL: 此序號已被刷過 (${inputSN})`, 'fail');
+        logResult(inputSN, 'FAIL', '重複刷入');
+      } 
+      // 2. 檢查是否在箱號 Excel 內
+      else if (targetSNs.has(inputSN)) {
+        scannedSNs.add(inputSN);
+        setStatus(`PASS: ${inputSN} 驗證成功！`, 'pass');
+        logResult(inputSN, 'PASS', '正確驗證');
+      } 
+      // 3. 不在箱號內
+      else {
+        setStatus(`FAIL: 此 SN 不在該箱中 (${inputSN})`, 'fail');
+        logResult(inputSN, 'FAIL', '不在箱號中');
+      }
+
+      updateProgress();
+      focusScanner();
+
+      // 檢查是否全數完成
+      if (scannedSNs.size === totalCount && totalCount > 0) {
+        setStatus('🎉 全數 SN 驗證完成！請點擊下方按鈕匯出報告。', 'finish');
+        document.getElementById('finishBtn').style.display = 'block';
+      }
+    }
+  }
+
+  function setStatus(msg, type) {
+    const box = document.getElementById('statusBox');
+    box.innerText = msg;
+    box.className = `status-msg status-${type}`;
+  }
+
+  function updateProgress() {
+    document.getElementById('progressText').innerText = `進度：${scannedSNs.size} / ${totalCount}`;
+  }
+
+  function focusScanner() {
+    setTimeout(() => {
+      document.getElementById('snScanner').focus();
+    }, 100);
+  }
+
+  function logResult(sn, result, note) {
+    scanLogs.push({
+      '檢驗人員': document.getElementById('inspectorName').value,
+      '檢驗日期': document.getElementById('inspectDate').value,
+      '產品序號_SN': sn,
+      '判定結果': result,
+      '備註說明': note,
+      '刷條碼時間': new Date().toLocaleTimeString()
+    });
+  }
+
+  // 匯出 Excel 比對報告
+  function exportResult() {
+    // 結合原 Excel 資料與比對結果
+    const name = document.getElementById('inspectorName').value;
+    const date = document.getElementById('inspectDate').value;
+
+    const finalReport = excelData.map(row => {
+      const snKey = Object.keys(row).find(k => k.trim() === '產品序號_SN');
+      const sn = row[snKey];
+      const isScanned = scannedSNs.has(String(sn).trim());
+      
+      return {
+        ...row,
+        'FQC檢驗人員': name,
+        'FQC檢驗日期': date,
+        'FQC最終比對狀態': isScanned ? 'PASS' : 'FAIL (未刷入)'
+      };
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(finalReport);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "FQC驗證結果");
+
+    XLSX.writeFile(workbook, `FQC驗證報告_${date}_${name}.xlsx`);
+    alert('報告已自動下載！');
+    location.reload(); // 重置頁面
+  }
+</script>
+
+</body>
+</html>
